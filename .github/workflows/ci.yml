@@ -1,0 +1,149 @@
+name: K8s Hybrid CI
+
+on: [push, pull_request]
+
+jobs:
+  integration-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # ==========================================
+      # 分支 1: 云端环境 (GitHub Actions)
+      # ==========================================
+      - name: "[Cloud] Create Kind Cluster"
+        if: ${{ !env.ACT }}
+        uses: helm/kind-action@v1.9.0
+        with:
+          cluster_name: ci-cluster
+          # 只有云端需要等待 Cluster Ready，本地假设已经是 Ready 的
+          wait: 60s 
+
+      # ==========================================
+      # 分支 2: 本地环境 (Act 模拟)
+      # ==========================================
+      - name: Cache Apt Packages (Local Act)
+        if: ${{ env.ACT }}
+        uses: actions/cache@v3
+        with:
+          path: |
+            /var/cache/apt/archives
+            /var/lib/apt/lists
+          key: apt-cache-${{ runner.os }}-v1
+
+      - name: Install Tools (kubectl/helm) for Local Act
+        if: ${{ env.ACT }}
+        run: |
+          # Prevent Docker from deleting apt cache
+          rm -f /etc/apt/apt.conf.d/docker-clean
+          mkdir -p /var/cache/apt/archives
+
+          # Install kubectl
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          mv kubectl /usr/local/bin/
+
+          # Install Helm
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | get_helm_version="v3.13.1" bash
+
+          # Install Maven
+          apt-get update
+          apt-get install -y maven
+
+      - name: Local Setup Kubeconfig
+        if: ${{ env.ACT }}
+        run: |
+          mkdir -p $HOME/.kube
+          # 将传入的 Secret 写入配置
+          echo "${{ secrets.LOCAL_KUBE_CONFIG }}" > $HOME/.kube/config
+          
+          # 【关键】替换 localhost 为 host.docker.internal
+          # 这样 act 容器才能通过 Docker 网络访问宿主机的 K8s API
+          sed -i 's/127.0.0.1/host.docker.internal/g' $HOME/.kube/config
+          sed -i 's/localhost/host.docker.internal/g' $HOME/.kube/config
+          
+          # 【新增】忽略 TLS 验证，因为 host.docker.internal 不在证书 SAN 中
+          # 移除 certificate-authority-data 字段 (如果有)
+          sed -i '/certificate-authority-data:/d' $HOME/.kube/config
+          # 添加 insecure-skip-tls-verify: true 到 cluster 配置
+          # 这里假设 config 结构比较标准，简单粗暴地替换
+          sed -i 's/server: https:\/\/host.docker.internal/insecure-skip-tls-verify: true\n    server: https:\/\/host.docker.internal/g' $HOME/.kube/config
+          
+          # 打印配置文件检查 (调试用，生产需谨慎)
+          # cat $HOME/.kube/config
+
+          # 打印集群信息验证连接
+          kubectl cluster-info
+          kubectl get nodes
+
+      # ==========================================
+      # Build Steps
+      # ==========================================
+      - name: Set up JDK 17
+        uses: actions/setup-java@v3
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Build with Maven
+        run: mvn clean package
+
+      - name: Build Docker Image
+        run: docker build -t echo-server:latest .
+
+      - name: "[Cloud] Load Image into Kind"
+        if: ${{ !env.ACT }}
+        run: kind load docker-image echo-server:latest --name ci-cluster
+
+      # ==========================================
+      # 下面是通用步骤 (云端和本地都执行)
+      # ==========================================
+      
+      - name: Deploy Middleware (Redis/Kafka)
+        run: |
+          # 建议创建一个独立的 namespace 防止污染本地环境
+          kubectl create namespace ci-test --dry-run=client -o yaml | kubectl apply -f -
+          
+          helm repo add bitnami https://charts.bitnami.com/bitnami
+          
+          # 部署到 ci-test 命名空间
+          helm upgrade --install redis-test bitnami/redis \
+            --namespace ci-test \
+            --set architecture=standalone \
+            --wait
+
+      - name: Deploy Echo Server
+        run: |
+          # Get Redis Password to Pass to App? 
+          # Or the app just needs to connect. Java code uses NO AUTH currently?
+          # Wait, standard bitnami redis HAS password.
+          # My Java code does NOT handle Redis password.
+          # Option 1: Disable Redis Password in Helm
+          # Option 2: Update Java to support password.
+          # Let's simple: Disable Redis Password for test.
+          helm upgrade --install redis-test bitnami/redis \
+            --namespace ci-test \
+            --set architecture=standalone \
+            --set auth.enabled=false \
+            --wait
+
+          kubectl run echo-server \
+            --image=echo-server:latest \
+            --image-pull-policy=Never \
+            --namespace ci-test \
+            --env="REDIS_HOST=redis-test-master" \
+            --env="REDIS_PORT=6379" \
+            --port=8086
+
+      - name: Run Tests
+        run: |
+          echo "Running tests against K8s..."
+          chmod +x tests/integration_test.sh
+          ./tests/integration_test.sh
+
+      - name: Cleanup Delete Namespace
+        if: always() 
+        run: |
+          kubectl delete namespace ci-test --ignore-not-found=true
