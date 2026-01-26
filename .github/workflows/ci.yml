@@ -32,20 +32,47 @@ jobs:
             /var/lib/apt/lists
           key: apt-cache-${{ runner.os }}-v1
 
+      - name: Cache Tools (kubectl/helm) for Local Act
+        if: ${{ env.ACT }}
+        uses: actions/cache@v3
+        with:
+          path: /opt/act-tools
+          key: act-tools-${{ runner.os }}-${{ runner.arch }}-v1
+
       - name: Install Tools (kubectl/helm) for Local Act
         if: ${{ env.ACT }}
         run: |
+          mkdir -p /opt/act-tools
+          ARCH=$(dpkg --print-architecture)
+          echo "Detected architecture: $ARCH"
+
           # Prevent Docker from deleting apt cache
           rm -f /etc/apt/apt.conf.d/docker-clean
           mkdir -p /var/cache/apt/archives
 
-          # Install kubectl
-          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-          chmod +x kubectl
-          mv kubectl /usr/local/bin/
+          # Install kubectl (Cached)
+          if [ ! -f /opt/act-tools/kubectl ]; then
+             echo "Downloading kubectl for $ARCH..."
+             curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/$ARCH/kubectl"
+             chmod +x kubectl
+             mv kubectl /opt/act-tools/
+          else
+             echo "Using cached kubectl"
+          fi
+          cp /opt/act-tools/kubectl /usr/local/bin/
 
-          # Install Helm
-          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | get_helm_version="v3.13.1" bash
+          # Install Helm (Cached)
+          if [ ! -f /opt/act-tools/helm ]; then
+             echo "Downloading helm for $ARCH..."
+             HELM_VERSION="v3.13.1"
+             curl -LO "https://get.helm.sh/helm-${HELM_VERSION}-linux-$ARCH.tar.gz"
+             tar -zxvf "helm-${HELM_VERSION}-linux-$ARCH.tar.gz"
+             mv linux-$ARCH/helm /opt/act-tools/
+             rm -rf linux-$ARCH "helm-${HELM_VERSION}-linux-$ARCH.tar.gz"
+          else
+             echo "Using cached helm"
+          fi
+          cp /opt/act-tools/helm /usr/local/bin/
 
           # Install Maven
           apt-get update
