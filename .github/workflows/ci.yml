@@ -23,15 +23,6 @@ jobs:
       # ==========================================
       # 分支 2: 本地环境 (Act 模拟)
       # ==========================================
-      - name: Cache Apt Packages (Local Act)
-        if: ${{ env.ACT }}
-        uses: actions/cache@v3
-        with:
-          path: |
-            /var/cache/apt/archives
-            /var/lib/apt/lists
-          key: apt-cache-${{ runner.os }}-v1
-
       - name: Cache Tools (kubectl/helm) for Local Act
         if: ${{ env.ACT }}
         uses: actions/cache@v3
@@ -80,27 +71,29 @@ jobs:
 
       - name: Local Setup Kubeconfig
         if: ${{ env.ACT }}
+        env:
+          KUBE_CONFIG_DATA: ${{ secrets.LOCAL_KUBE_CONFIG }}
         run: |
           mkdir -p $HOME/.kube
-          # 将传入的 Secret 写入配置
-          echo "${{ secrets.LOCAL_KUBE_CONFIG }}" > $HOME/.kube/config
+          
+          # 【修改】使用环境变量 + base64 解码，防止字符转义问题
+          # 请确保运行 act 时传入的是 base64 编码的内容: 
+          # act -j integration-test -s LOCAL_KUBE_CONFIG="$(base64 < ~/.kube/config)"
+          echo "$KUBE_CONFIG_DATA" | base64 -d > $HOME/.kube/config
+          
+          export KUBECONFIG=$HOME/.kube/config
           
           # 【关键】替换 localhost 为 host.docker.internal
-          # 这样 act 容器才能通过 Docker 网络访问宿主机的 K8s API
           sed -i 's/127.0.0.1/host.docker.internal/g' $HOME/.kube/config
           sed -i 's/localhost/host.docker.internal/g' $HOME/.kube/config
           
-          # 【新增】忽略 TLS 验证，因为 host.docker.internal 不在证书 SAN 中
-          # 移除 certificate-authority-data 字段 (如果有)
-          sed -i '/certificate-authority-data:/d' $HOME/.kube/config
-          # 添加 insecure-skip-tls-verify: true 到 cluster 配置
-          # 这里假设 config 结构比较标准，简单粗暴地替换
-          sed -i 's/server: https:\/\/host.docker.internal/insecure-skip-tls-verify: true\n    server: https:\/\/host.docker.internal/g' $HOME/.kube/config
+          # 【优化】使用 kubectl 命令修改配置，比 sed 更安全
+          # 获取当前上下文名称
+          CURRENT_CONTEXT=$(kubectl config current-context)
+          # 禁用 TLS 验证
+          kubectl config set-cluster $(kubectl config view -o jsonpath="{.contexts[?(@.name=='$CURRENT_CONTEXT')].context.cluster}") --insecure-skip-tls-verify=true
           
-          # 打印配置文件检查 (调试用，生产需谨慎)
-          # cat $HOME/.kube/config
-
-          # 打印集群信息验证连接
+          # 调试：打印节点信息
           kubectl cluster-info
           kubectl get nodes
 
@@ -112,7 +105,8 @@ jobs:
         with:
           java-version: '17'
           distribution: 'temurin'
-          cache: maven
+          # 在 Act 环境中禁用自动缓存(防止Post步骤卡死)，建议使用 volume 挂载宿主机 .m2
+          cache: ${{ !env.ACT && 'maven' || '' }}
 
       - name: Build with Maven
         run: mvn clean package
